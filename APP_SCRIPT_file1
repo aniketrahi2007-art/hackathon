@@ -1,0 +1,356 @@
+#code.gs()
+/**
+ * SMARTPREP Hackathon: Creates all required tabs + headers for:
+ * - Artifact Pack
+ * - Jobs feed (30+)
+ * - Apply queue
+ * - Applications tracker (receipts, retries, failure handling)
+ * - Apply policy controls
+ *
+ * Usage:
+ * 1) Create a new Google Sheet
+ * 2) Extensions → Apps Script
+ * 3) Paste this code
+ * 4) Run setupHackathonSheet()
+ */
+
+function setupHackathonSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const spec = [
+    {
+      name: "STUDENT_PROFILE",
+      headers: [
+        "student_id",
+        "name",
+        "email",
+        "phone",
+        "location",
+        "remote_ok",
+        "start_date",
+        "visa_status",
+        "links_json",
+        "facts_profile_json",
+        "last_updated_at"
+      ],
+      seedRows: [
+        [
+          "student_demo_001",
+          "", "", "",
+          "",
+          "TRUE",
+          "",
+          "",
+          "[]",
+          "{}",
+          new Date().toISOString()
+        ]
+      ]
+    },
+    {
+      name: "BULLET_BANK",
+      headers: [
+        "bullet_id",
+        "student_id",
+        "source_type",          // project | internship | education | other
+        "source_name",
+        "bullet_text",          // facts-only bullet
+        "skills_tags_json",     // ["python","sql"]
+        "evidence_links_json",  // ["https://..."]
+        "created_at"
+      ],
+      seedRows: []
+    },
+    {
+      name: "ANSWER_LIBRARY",
+      headers: [
+        "student_id",
+        "question_key",         // work_auth | availability | relocation | salary | etc.
+        "question_text",
+        "answer_text",
+        "evidence_note",        // optional: where this came from
+        "last_updated_at"
+      ],
+      seedRows: [
+        ["student_demo_001", "work_authorization", "Are you authorized to work?", "unknown", "not provided by student", new Date().toISOString()],
+        ["student_demo_001", "availability", "When can you start?", "unknown", "not provided by student", new Date().toISOString()],
+        ["student_demo_001", "relocation", "Are you open to relocation?", "unknown", "not provided by student", new Date().toISOString()],
+        ["student_demo_001", "salary_expectations", "What are your salary expectations?", "not_provided", "not provided by student", new Date().toISOString()]
+      ]
+    },
+    {
+      name: "PROOF_PACK",
+      headers: [
+        "proof_id",
+        "student_id",
+        "label",
+        "url",
+        "proof_type",      // github | portfolio | certificate | demo | other
+        "notes",
+        "created_at"
+      ],
+      seedRows: []
+    },
+    {
+      name: "JOBS",
+      headers: [
+        "job_id",
+        "company",
+        "title",
+        "location",
+        "remote",               // TRUE/FALSE
+        "visa_sponsorship",     // yes | no | unknown
+        "start_date",
+        "requirements_text",
+        "description_text",
+        "source",               // sandbox_seed | partner_api | etc.
+        "created_at"
+      ],
+      seedRows: []
+    },
+    {
+      name: "APPLY_QUEUE",
+      headers: [
+        "queue_id",
+        "job_id",
+        "student_id",
+        "match_score",                // 0-1
+        "score_breakdown_json",       // explainability
+        "requirements_evidence_json", // requirement -> evidence mapping
+        "status",                     // queued | skipped | selected
+        "decision_reason",
+        "created_at"
+      ],
+      seedRows: []
+    },
+    {
+      name: "APPLICATIONS",
+      headers: [
+        "application_id",
+        "receipt_id",
+        "job_id",
+        "company",
+        "title",
+        "student_id",
+        "status",               // submitted | failed | retried | queued
+        "submitted_at",
+        "received_at",
+        "payload_hash",
+        "retry_count",
+        "failure_reason",
+        "package_json"
+      ],
+      seedRows: []
+    },
+    {
+      name: "APPLY_POLICY",
+      headers: [
+        "policy_key",
+        "policy_value",
+        "notes",
+        "last_updated_at"
+      ],
+      seedRows: [
+        ["kill_switch", "FALSE", "If TRUE, agent must stop applying immediately", new Date().toISOString()],
+        ["max_applications_per_run", "10", "Max applications per run (demo: 10)", new Date().toISOString()],
+        ["min_match_score", "0.55", "Minimum score to apply (0-1)", new Date().toISOString()],
+        ["blocked_companies_json", '["EvilCorp"]', "List of companies never apply to", new Date().toISOString()],
+        ["blocked_role_keywords_json", '["unpaid","commission-only"]', "Role keywords to exclude", new Date().toISOString()],
+        ["require_remote_ok", "TRUE", "If TRUE, skip non-remote roles", new Date().toISOString()],
+        ["visa_required", "", "If set, enforce visa constraint (e.g., needs_sponsorship)", new Date().toISOString()],
+        ["cooldown_seconds", "1", "Delay between apply attempts", new Date().toISOString()]
+      ]
+    }
+  ];
+
+  // Create sheets + headers
+  spec.forEach(s => {
+    const sh = ensureSheet_(ss, s.name);
+    ensureHeaders_(sh, s.headers);
+    seedIfEmpty_(sh, s.headers.length, s.seedRows || []);
+  });
+
+  // Optional: basic formatting
+  spec.forEach(s => {
+    const sh = ss.getSheetByName(s.name);
+    styleHeaderRow_(sh);
+    autoResize_(sh);
+  });
+
+  SpreadsheetApp.flush();
+  Logger.log("✅ Setup complete. Tabs + headers created.");
+}
+
+function ensureSheet_(ss, name) {
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  return sh;
+}
+
+function ensureHeaders_(sh, headers) {
+  const lastCol = sh.getLastColumn();
+  const lastRow = sh.getLastRow();
+
+  // If sheet is empty, set headers
+  if (lastRow === 0) {
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+    return;
+  }
+
+  // If first row exists but is empty, set headers
+  const firstRow = sh.getRange(1, 1, 1, Math.max(headers.length, lastCol)).getValues()[0];
+  const hasAny = firstRow.some(v => String(v).trim() !== "");
+  if (!hasAny) {
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+    return;
+  }
+
+  // If headers exist but missing columns, extend (safe append only)
+  const existingHeaders = sh.getRange(1, 1, 1, lastCol).getValues()[0].map(String);
+  if (existingHeaders.length < headers.length) {
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+  }
+}
+
+function seedIfEmpty_(sh, headerLen, seedRows) {
+  if (!seedRows || seedRows.length === 0) return;
+
+  const lastRow = sh.getLastRow();
+  // If only header row exists, seed
+  if (lastRow <= 1) {
+    sh.getRange(2, 1, seedRows.length, headerLen).setValues(seedRows);
+  }
+}
+
+function styleHeaderRow_(sh) {
+  const lastCol = Math.max(1, sh.getLastColumn());
+  const header = sh.getRange(1, 1, 1, lastCol);
+
+  header.setFontWeight("bold");
+  header.setWrap(true);
+
+  sh.setFrozenRows(1);
+  sh.getRange(1, 1, sh.getMaxRows(), 1).setWrap(true);
+}
+
+
+function autoResize_(sh) {
+  const lastCol = Math.max(1, sh.getLastColumn());
+  sh.autoResizeColumns(1, lastCol);
+}
+
+
+
+//2nd phase (just adding some sample jobs in the list)
+
+function seedDemoJobs_40() {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("JOBS");
+  if (!sh) throw new Error("Missing JOBS sheet");
+
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(String);
+  if (headers[0] !== "job_id") throw new Error("JOBS headers not found or incorrect.");
+
+  // If already has jobs, don't duplicate (safe)
+  const lastRow = sh.getLastRow();
+  if (lastRow > 1) {
+    Logger.log("JOBS already has data. Clear rows 2+ if you want reseed.");
+    return;
+  }
+
+  const now = new Date().toISOString();
+
+  // 40 sandbox jobs (realistic variety for matching)
+  const jobs = [
+    ["J001","NovaPay","Data Analyst Intern","Remote","TRUE","unknown","2026-03-01","Excel, SQL, dashboards, data cleaning","Work with ops data; build weekly dashboards; write SQL queries","sandbox_seed",now],
+    ["J002","BrightCart","Backend Intern (Python)","Remote","TRUE","unknown","2026-03-15","Python, APIs, data structures, Git","Build REST APIs; write clean code; collaborate via PRs","sandbox_seed",now],
+    ["J003","CloudKite","ML Intern","Remote","TRUE","unknown","2026-03-10","Python, machine learning, pandas, model evaluation","Train and evaluate models; document experiments","sandbox_seed",now],
+    ["J004","FinVista","Business Analyst (Entry)","Bengaluru","FALSE","unknown","2026-04-01","Excel, communication, problem-solving","Requirements gathering; stakeholder updates; reporting","sandbox_seed",now],
+    ["J005","HealthPulse","Data Science Intern","Remote","TRUE","unknown","2026-03-05","Python, statistics, SQL, storytelling","Analyze datasets; build insights; present findings","sandbox_seed",now],
+    ["J006","ShipRight","Operations Analyst","Remote","TRUE","unknown","2026-03-20","Excel, process improvement, data analysis","Track KPIs; propose process improvements","sandbox_seed",now],
+    ["J007","EduStack","Product Intern","Remote","TRUE","unknown","2026-03-18","Research, analytics, writing","Support product discovery; analyze user feedback","sandbox_seed",now],
+    ["J008","RetailIQ","BI Intern","Remote","TRUE","unknown","2026-03-12","Power BI, Excel, SQL","Build BI dashboards; automate reporting","sandbox_seed",now],
+    ["J009","CodeCrate","Frontend Intern","Remote","TRUE","unknown","2026-03-22","React, JavaScript, UI","Build UI features; fix bugs; write components","sandbox_seed",now],
+    ["J010","DataDock","ETL Intern","Remote","TRUE","unknown","2026-03-08","Python, SQL, data pipelines","Build simple ETL scripts; validate data quality","sandbox_seed",now],
+
+    ["J011","OpsZen","Analytics Intern","Remote","TRUE","unknown","2026-03-02","Excel, SQL, KPI tracking","Daily reporting; KPI tracking; insights","sandbox_seed",now],
+    ["J012","GreenGrid","Python Intern","Remote","TRUE","unknown","2026-03-25","Python, APIs, testing","API integrations; unit tests; documentation","sandbox_seed",now],
+    ["J013","MediNote","QA Intern","Remote","TRUE","unknown","2026-03-15","Testing, attention to detail","Write test cases; log bugs; verify fixes","sandbox_seed",now],
+    ["J014","AeroLens","Data Intern","Remote","TRUE","unknown","2026-03-11","Excel, SQL, basic stats","Data cleaning; reporting; ad-hoc analysis","sandbox_seed",now],
+    ["J015","BankByte","Analyst Intern","Remote","TRUE","unknown","2026-03-19","Excel, SQL, communication","Weekly reports; performance analysis; summaries","sandbox_seed",now],
+    ["J016","ShopSphere","Growth Intern","Remote","TRUE","unknown","2026-03-21","Analytics, experimentation","Track funnel metrics; propose experiments","sandbox_seed",now],
+    ["J017","VisionWare","Computer Vision Intern","Remote","TRUE","unknown","2026-03-27","Python, OpenCV, ML basics","Prototype CV models; evaluate results","sandbox_seed",now],
+    ["J018","LedgerLoop","FinOps Intern","Remote","TRUE","unknown","2026-03-29","Excel, reconciliation","Reconcile reports; automate spreadsheets","sandbox_seed",now],
+    ["J019","SurveyPilot","Research Intern","Remote","TRUE","unknown","2026-03-30","Research, writing, data entry","Run surveys; summarize insights","sandbox_seed",now],
+    ["J020","CoreStack","Software Intern","Remote","TRUE","unknown","2026-03-16","Python or Java, Git, debugging","Implement features; fix issues; code reviews","sandbox_seed",now],
+
+    ["J021","CareBridge","Data Analyst (Entry)","Remote","TRUE","unknown","2026-04-05","SQL, Excel, dashboards, communication","Maintain dashboards; business reporting","sandbox_seed",now],
+    ["J022","PulseMart","BI Analyst Intern","Remote","TRUE","unknown","2026-04-02","Power BI, SQL, Excel","BI dashboards; stakeholder reporting","sandbox_seed",now],
+    ["J023","DevHarbor","API Intern","Remote","TRUE","unknown","2026-04-10","Python, REST, JSON","Integrate APIs; write endpoints; docs","sandbox_seed",now],
+    ["J024","LearnMint","EdTech Analyst Intern","Remote","TRUE","unknown","2026-04-01","Excel, analysis, writing","Analyze student performance; prepare insights","sandbox_seed",now],
+    ["J025","SecureTrail","Security Intern","Remote","TRUE","unknown","2026-04-12","Basics of security, curiosity","Assist audits; document findings","sandbox_seed",now],
+    ["J026","MapNexus","GIS Data Intern","Remote","TRUE","unknown","2026-04-08","Data cleaning, Excel","Clean geo datasets; report anomalies","sandbox_seed",now],
+    ["J027","AdPulse","Marketing Analytics Intern","Remote","TRUE","unknown","2026-04-06","Excel, SQL, attribution basics","Campaign reporting; ROAS dashboards","sandbox_seed",now],
+    ["J028","BuildBee","Project Intern","Remote","TRUE","unknown","2026-04-03","Organization, communication","Track tasks; create weekly updates","sandbox_seed",now],
+    ["J029","QuantSnap","Quant Intern","Remote","TRUE","unknown","2026-04-14","Python, statistics","Analyze time series; basic modeling","sandbox_seed",now],
+    ["J030","Supportly","Customer Ops Intern","Remote","TRUE","unknown","2026-04-07","Communication, spreadsheets","Support ops team; track issues; reporting","sandbox_seed",now],
+
+    ["J031","NexaHR","People Analytics Intern","Remote","TRUE","unknown","2026-04-09","Excel, data analysis","HR metrics; dashboards; reporting","sandbox_seed",now],
+    ["J032","FleetFox","Logistics Analyst Intern","Remote","TRUE","unknown","2026-04-11","Excel, KPIs","Fleet KPIs; weekly insights","sandbox_seed",now],
+    ["J033","TradeCraft","Data Engineer Intern","Remote","TRUE","unknown","2026-04-15","Python, SQL, pipelines","Build pipelines; validate data","sandbox_seed",now],
+    ["J034","StudioSpark","Design Ops Intern","Remote","TRUE","unknown","2026-04-04","Organization, docs","Track design tasks; maintain docs","sandbox_seed",now],
+    ["J035","DocuFlow","Automation Intern","Remote","TRUE","unknown","2026-04-16","Apps Script, spreadsheets","Automate workflow using Sheets + Apps Script","sandbox_seed",now],
+    ["J036","InsightLake","Analytics Engineer Intern","Remote","TRUE","unknown","2026-04-17","SQL, dbt (optional), pipelines","Transform data; maintain models","sandbox_seed",now],
+    ["J037","CodeMeter","Test Automation Intern","Remote","TRUE","unknown","2026-04-18","Python, testing","Write automated tests; CI basics","sandbox_seed",now],
+    ["J038","FinGrove","Reporting Intern","Remote","TRUE","unknown","2026-04-19","Excel, reporting","Monthly reporting pack; variance analysis","sandbox_seed",now],
+    ["J039","MedAxis","Clinical Data Intern","Remote","TRUE","unknown","2026-04-20","Data entry, Excel","Maintain datasets; verify integrity","sandbox_seed",now],
+    ["J040","SkyNote","General Intern (Data)","Remote","TRUE","unknown","2026-04-21","Excel, SQL, communication","Support analytics; build small reports","sandbox_seed",now],
+  ];
+
+  sh.getRange(2, 1, jobs.length, headers.length).setValues(jobs);
+  sh.autoResizeColumns(1, headers.length);
+  Logger.log("✅ Seeded 40 demo jobs into JOBS tab.");
+}
+
+
+// phase 3 
+
+// NEW: POST ?path=api/upsert_student_profile
+// Body JSON must include: student_id and the columns to write.
+function handleUpsertStudentProfile_(payload) {
+  const sheetName = "STUDENT_PROFILE";
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName);
+  if (!sh) throw new Error("Missing sheet: " + sheetName);
+
+  if (!payload.student_id) {
+    return { ok: false, error: "Missing student_id" };
+  }
+
+  const data = sh.getDataRange().getValues();
+  if (data.length < 1) throw new Error("STUDENT_PROFILE missing header row");
+
+  const headers = data[0].map(h => String(h).trim());
+  const idCol = headers.indexOf("student_id");
+  if (idCol === -1) throw new Error("STUDENT_PROFILE must have 'student_id' header");
+
+  // Find existing row
+  let targetRow = -1;
+  for (let r = 1; r < data.length; r++) {
+    if (String(data[r][idCol]).trim() === String(payload.student_id).trim()) {
+      targetRow = r + 1; // sheet rows are 1-indexed
+      break;
+    }
+  }
+
+  // Build row values in header order
+  const rowValues = headers.map(h => (payload[h] !== undefined ? payload[h] : ""));
+
+  if (targetRow === -1) {
+    // Append
+    sh.appendRow(rowValues);
+    return { ok: true, action: "appended", student_id: payload.student_id };
+  } else {
+    // Update the entire row
+    sh.getRange(targetRow, 1, 1, headers.length).setValues([rowValues]);
+    return { ok: true, action: "updated", student_id: payload.student_id, row: targetRow };
+  }
+}
