@@ -1,0 +1,107 @@
+#sheetlogin.gs()
+function setupLoginSystemTabs() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const tabs = [
+    {
+      name: "ACCOUNTS",
+      headers: [
+        "account_id",        // uuid
+        "role",              // candidate | company | admin
+        "email",
+        "display_name",
+        "pin_hash",          // demo auth (hashed)
+        "company_id",        // only for company accounts
+        "is_active",
+        "created_at",
+        "last_login_at"
+      ]
+    },
+    {
+      name: "SESSIONS",
+      headers: [
+        "session_token",     // random token
+        "account_id",
+        "role",
+        "company_id",
+        "created_at",
+        "expires_at",
+        "is_active"
+      ]
+    },
+    {
+      name: "COMPANIES",
+      headers: [
+        "company_id",        // uuid
+        "company_name",
+        "contact_email",
+        "created_at",
+        "is_active"
+      ]
+    }
+  ];
+
+  tabs.forEach(t => {
+    const sh = ensureSheet_(ss, t.name);
+    ensureHeaders_(sh, t.headers);
+    styleHeaderRow_(sh);
+    autoResize_(sh);
+  });
+
+  // Add company_id to JOBS if not present (safe append)
+  const jobs = ss.getSheetByName("JOBS");
+  if (jobs) {
+    const headers = jobs.getRange(1, 1, 1, jobs.getLastColumn()).getValues()[0].map(String);
+    if (!headers.includes("company_id")) {
+      jobs.getRange(1, jobs.getLastColumn() + 1).setValue("company_id");
+      styleHeaderRow_(jobs);
+      autoResize_(jobs);
+    }
+  }
+
+  SpreadsheetApp.flush();
+  Logger.log("✅ Login system tabs created + JOBS updated with company_id (if missing).");
+}
+
+/***************
+ * Helpers (reuse if already present; if duplicated, keep only one copy)
+ ***************/
+function ensureSheet_(ss, name) {
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  return sh;
+}
+
+function ensureHeaders_(sh, headers) {
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+
+  if (lastRow === 0) {
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+    return;
+  }
+
+  const firstRow = sh.getRange(1, 1, 1, Math.max(headers.length, lastCol)).getValues()[0];
+  const hasAny = firstRow.some(v => String(v).trim() !== "");
+  if (!hasAny) {
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+    return;
+  }
+
+  const existingHeaders = sh.getRange(1, 1, 1, lastCol).getValues()[0].map(String);
+  if (existingHeaders.length < headers.length) {
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+  }
+}
+
+function styleHeaderRow_(sh) {
+  const lastCol = Math.max(1, sh.getLastColumn());
+  const header = sh.getRange(1, 1, 1, lastCol);
+  header.setFontWeight("bold");
+  sh.setFrozenRows(1);
+}
+
+function autoResize_(sh) {
+  const lastCol = Math.max(1, sh.getLastColumn());
+  sh.autoResizeColumns(1, lastCol);
+}
