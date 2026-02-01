@@ -1,0 +1,582 @@
+#webapp.gs()
+/***********************
+ * SANDBOX JOB PORTAL
+ * UI Dashboard + Backend APIs + Mini-Agent Run
+ *
+ * UI:
+ *   /exec  → Dashboard
+ *
+ * API (for Colab):
+ *   GET  ?path=api/ping
+ *   GET  ?path=api/jobs
+ *   GET  ?path=api/table&name=...
+ *   GET  ?path=api/student_summary&student_id=...
+ *
+ *   POST ?path=api/upsert_student_profile
+ *   POST ?path=api/replace_rows
+ *   POST ?path=api/apply
+ *   POST ?path=api/log_application_attempt
+ *   POST ?path=api/run_autosearch_apply
+ ***********************/
+
+const SHEETS = {
+  JOBS: "JOBS",
+  APPLICATIONS: "APPLICATIONS",
+  APPLY_POLICY: "APPLY_POLICY",
+  APPLY_QUEUE: "APPLY_QUEUE",
+  STUDENT_PROFILE: "STUDENT_PROFILE",
+  BULLET_BANK: "BULLET_BANK",
+  PROOF_PACK: "PROOF_PACK",
+  ANSWER_LIBRARY: "ANSWER_LIBRARY"
+};
+
+/***********************
+ * doGet
+ ***********************/
+function doGet(e) {
+  const p = (e && e.parameter) ? e.parameter : {};
+  const path = String(p.path || "").trim();
+
+  // ---------- API ----------
+  if (path) {
+    if (path === "api/ping") {
+      return json_({ ok: true, message: "pong", ts: new Date().toISOString() });
+    }
+
+    if (path === "api/jobs") {
+      const jobs = readTable_(SHEETS.JOBS);
+      return json_({ ok: true, count: jobs.length, jobs });
+    }
+
+    if (path === "api/table") {
+      const name = String(p.name || "").trim();
+      const allowed = [
+        "STUDENT_PROFILE","BULLET_BANK","PROOF_PACK","ANSWER_LIBRARY",
+        "APPLY_POLICY","APPLY_QUEUE","APPLICATIONS","JOBS"
+      ];
+      if (!allowed.includes(name)) return json_({ ok: false, error: "Table not allowed" });
+      const rows = readTable_(name);
+      return json_({ ok: true, name, count: rows.length, rows });
+    }
+
+    if (path === "api/student_summary") {
+      const studentId = String(p.student_id || "").trim();
+      if (!studentId) return json_({ ok: false, error: "Missing student_id" });
+
+      const apps = readTable_(SHEETS.APPLICATIONS).filter(a => String(a.student_id) === studentId);
+      const queue = readTable_(SHEETS.APPLY_QUEUE).filter(q => String(q.student_id) === studentId);
+
+      const submitted = apps.filter(a => String(a.status) === "submitted").length;
+      const failed = apps.filter(a => String(a.status) !== "submitted").length;
+
+      return json_({
+        ok: true,
+        student_id: studentId,
+        apply_queue_count: queue.length,
+        applications_count: apps.length,
+        submitted_count: submitted,
+        failed_count: failed,
+        latest_applications: apps.slice(-10)
+      });
+    }
+
+    return json_({ ok: false, error: "Unknown API path" });
+  }
+
+  // ---------- UI ----------
+  const t = HtmlService.createTemplateFromFile("Dashboard");
+  t.webAppUrl = ScriptApp.getService().getUrl(); // not required anymore, but handy
+  return t.evaluate()
+    .setTitle("Auto-Apply Job Dashboard")
+    .addMetaTag("viewport", "width=device-width, initial-scale=1");
+}
+
+/***********************
+ * doPost (for Colab/API)
+ ***********************/
+function doPost(e) {
+  const p = (e && e.parameter) ? e.parameter : {};
+  const path = String(p.path || "").trim();
+
+  let payload = {};
+  try {
+    payload = JSON.parse((e.postData && e.postData.contents) ? e.postData.contents : "{}");
+  } catch (err) {
+    return json_({ ok: false, error: "Invalid JSON body" });
+  }
+
+  if (path === "api/upsert_student_profile") return json_(handleUpsertStudentProfile_(payload));
+  if (path === "api/replace_rows") return json_(handleReplaceRows_(payload));
+  if (path === "api/apply") return doPostApply_(payload);
+  if (path === "api/log_application_attempt") return json_(handleLogApplicationAttempt_(payload));
+  if (path === "api/run_autosearch_apply") return json_(handleRunAutoSearchApply_(payload));
+
+  return json_({ ok: false, error: "Unknown POST path" });
+}
+
+/***********************
+ * UI RPC FUNCTIONS (for Dashboard via google.script.run)
+ * These avoid fetch() issues and prevent hanging.
+ ***********************/
+function ui_upsertProfile(profileObj) {
+  return handleUpsertStudentProfile_(profileObj);
+}
+
+function ui_replaceBullets(studentId, bulletsRows) {
+  return handleReplaceRows_({
+    sheet: SHEETS.BULLET_BANK,
+    key_col: "student_id",
+    key_val: String(studentId),
+    rows: bulletsRows
+  });
+}
+
+function ui_runAuto(studentId, maxApps) {
+  return handleRunAutoSearchApply_({
+    student_id: String(studentId),
+    max_applications: Number(maxApps || 10)
+  });
+}
+
+function ui_getSummary(studentId) {
+  const sid = String(studentId || "").trim();
+  if (!sid) return { ok: false, error: "Missing student_id" };
+
+  const apps = readTable_(SHEETS.APPLICATIONS).filter(a => String(a.student_id) === sid);
+  const queue = readTable_(SHEETS.APPLY_QUEUE).filter(q => String(q.student_id) === sid);
+
+  return {
+    ok: true,
+    student_id: sid,
+    apply_queue_count: queue.length,
+    applications_count: apps.length,
+    submitted_count: apps.filter(a => String(a.status) === "submitted").length,
+    failed_count: apps.filter(a => String(a.status) !== "submitted").length,
+    latest_applications: apps.slice(-10)
+  };
+}
+
+function ui_getLatestApplications(studentId, limit) {
+  const sid = String(studentId || "").trim();
+  const n = Math.max(1, Math.min(50, Number(limit || 10)));
+  const apps = readTable_(SHEETS.APPLICATIONS)
+    .filter(a => String(a.student_id) === sid)
+    .slice(-n);
+  return { ok: true, student_id: sid, count: apps.length, applications: apps };
+}
+
+/***********************
+ * BACKEND HANDLERS (same behavior as before)
+ ***********************/
+function handleUpsertStudentProfile_(p) {
+  const required = ["student_id", "name", "email", "location"];
+  for (const k of required) {
+    if (!String(p[k] || "").trim()) return { ok: false, error: `Missing ${k}` };
+  }
+
+  const studentId = String(p.student_id).trim();
+
+  const facts = {
+    student_id: studentId,
+    name: String(p.name || "").trim(),
+    email: String(p.email || "").trim(),
+    phone: String(p.phone || "").trim(),
+    location: String(p.location || "").trim(),
+    remote_ok: !!p.remote_ok,
+    start_date: String(p.start_date || "").trim(),
+    visa_status: String(p.visa_status || "unknown").trim(),
+    skills: Array.isArray(p.skills) ? p.skills.map(s => String(s).trim()).filter(Boolean) : [],
+    links: Array.isArray(p.links) ? p.links : [],
+    notes: String(p.notes || "").trim()
+  };
+
+  const sh = sheet_(SHEETS.STUDENT_PROFILE);
+  const values = sh.getDataRange().getValues();
+  const headers = values[0].map(h => String(h).trim());
+
+  const idxStudent = headers.indexOf("student_id");
+  if (idxStudent === -1) return { ok: false, error: "STUDENT_PROFILE missing student_id header" };
+
+  let rowNum = -1;
+  for (let r = 1; r < values.length; r++) {
+    if (String(values[r][idxStudent]).trim() === studentId) {
+      rowNum = r + 1;
+      break;
+    }
+  }
+
+  const rowObj = {
+    student_id: studentId,
+    name: facts.name,
+    email: facts.email,
+    phone: facts.phone,
+    location: facts.location,
+    remote_ok: facts.remote_ok,
+    start_date: facts.start_date,
+    visa_status: facts.visa_status,
+    links_json: JSON.stringify(facts.links || []),
+    facts_profile_json: JSON.stringify(facts),
+    last_updated_at: new Date().toISOString()
+  };
+
+  if (rowNum === -1) {
+    appendRow_(SHEETS.STUDENT_PROFILE, rowObj);
+    return { ok: true, action: "inserted", student_id: studentId };
+  } else {
+    const rowValues = headers.map(h => (rowObj[h] !== undefined ? rowObj[h] : ""));
+    sh.getRange(rowNum, 1, 1, headers.length).setValues([rowValues]);
+    return { ok: true, action: "updated", student_id: studentId, row: rowNum };
+  }
+}
+
+function handleReplaceRows_(payload) {
+  const sheetName = String(payload.sheet || "").trim();
+  const keyCol = String(payload.key_col || "").trim();
+  const keyVal = String(payload.key_val || "").trim();
+  const rows = payload.rows;
+
+  if (!sheetName || !keyCol || !keyVal || !Array.isArray(rows)) {
+    return { ok: false, error: "Missing sheet/key_col/key_val/rows" };
+  }
+
+  const sh = sheet_(sheetName);
+  const data = sh.getDataRange().getValues();
+  if (data.length < 1) return { ok: false, error: "Sheet has no headers: " + sheetName };
+
+  const headers = data[0].map(h => String(h).trim());
+  const keyIndex = headers.indexOf(keyCol);
+  if (keyIndex === -1) return { ok: false, error: `Key column not found: ${keyCol}` };
+
+  for (let r = data.length - 1; r >= 1; r--) {
+    if (String(data[r][keyIndex]).trim() === keyVal) {
+      sh.deleteRow(r + 1);
+    }
+  }
+
+  rows.forEach(obj => {
+    const rowValues = headers.map(h => (obj[h] !== undefined ? obj[h] : ""));
+    sh.appendRow(rowValues);
+  });
+
+  return { ok: true, action: "replaced", sheet: sheetName, count: rows.length };
+}
+
+function doPostApply_(payload) {
+  const required = ["job_id", "student_id", "package", "submitted_at"];
+  for (const k of required) {
+    if (!payload[k]) return json_({ ok: false, error: `Missing ${k}` });
+  }
+
+  const policy = readPolicy_();
+  if (String(policy.kill_switch || "").toUpperCase() === "TRUE") {
+    return json_({ ok: false, error: "KILL_SWITCH_ON" });
+  }
+
+  const r = Math.random();
+  if (r < 1 / 12) return json_({ ok: false, error: "RATE_LIMIT_SIMULATED" });
+  if (r < 1 / 10) return json_({ ok: false, error: "TEMP_FAILURE_SIMULATED" });
+
+  const receiptId = Utilities.getUuid();
+  const now = new Date().toISOString();
+
+  appendRow_(SHEETS.APPLICATIONS, {
+    application_id: Utilities.getUuid(),
+    receipt_id: receiptId,
+    job_id: payload.job_id,
+    company: payload.company || "",
+    title: payload.title || "",
+    student_id: payload.student_id,
+    status: "submitted",
+    submitted_at: payload.submitted_at,
+    received_at: now,
+    payload_hash: sha256_(JSON.stringify(payload)).slice(0, 16),
+    retry_count: payload.retry_count || 0,
+    failure_reason: "",
+    package_json: JSON.stringify(payload.package)
+  });
+
+  return json_({ ok: true, receipt: { receipt_id: receiptId, received_at: now } });
+}
+
+function handleLogApplicationAttempt_(payload) {
+  const required = ["job_id", "student_id", "status", "submitted_at"];
+  for (const k of required) {
+    if (!payload[k]) return { ok: false, error: `Missing ${k}` };
+  }
+
+  const nowIso = new Date().toISOString();
+
+  appendRow_(SHEETS.APPLICATIONS, {
+    application_id: Utilities.getUuid(),
+    receipt_id: payload.receipt_id || "",
+    job_id: String(payload.job_id),
+    company: payload.company || "",
+    title: payload.title || "",
+    student_id: String(payload.student_id),
+    status: String(payload.status),
+    submitted_at: payload.submitted_at,
+    received_at: nowIso,
+    payload_hash: (payload.payload_hash || "").toString(),
+    retry_count: payload.retry_count || 0,
+    failure_reason: payload.failure_reason || "",
+    package_json: payload.package_json || ""
+  });
+
+  return { ok: true, action: "logged", received_at: nowIso };
+}
+
+function handleRunAutoSearchApply_(p) {
+  const studentId = String(p.student_id || "").trim();
+  if (!studentId) return { ok: false, error: "Missing student_id" };
+
+  const profRows = readTable_(SHEETS.STUDENT_PROFILE).filter(r => String(r.student_id) === studentId);
+  if (profRows.length === 0) return { ok: false, error: "Student not found in STUDENT_PROFILE" };
+
+  let facts = {};
+  try { facts = JSON.parse(profRows[0].facts_profile_json || "{}"); } catch (e) { facts = {}; }
+
+  const skills = Array.isArray(facts.skills) ? facts.skills.map(s => String(s).toLowerCase()) : [];
+  const remoteOk = !!facts.remote_ok;
+  const location = String(facts.location || "").toLowerCase();
+
+  const bullets = readTable_(SHEETS.BULLET_BANK)
+    .filter(b => String(b.student_id) === studentId)
+    .map(b => String(b.bullet_text || "").toLowerCase());
+
+  const policy = readPolicy_();
+  const maxApps = Number(p.max_applications || policy.max_applications_per_run || 10);
+  const minScore = Number(p.min_match_score || policy.min_match_score || 0.55);
+
+  const blockedCompanies = parseCsv_(policy.blocked_companies || "");
+  const blockedRoleKeywords = parseCsv_(policy.blocked_role_keywords || "");
+
+  const jobs = readTable_(SHEETS.JOBS);
+
+    const scored = jobs.map(j => {
+    const reqText = (String(j.requirements_text || "") + " " + String(j.description_text || "")).toLowerCase();
+    const fullText = (
+      String(j.title || "") + " " +
+      String(j.company || "") + " " +
+      String(j.location || "") + " " +
+      reqText
+    ).toLowerCase();
+
+    const jobRemote = String(j.remote || "").toLowerCase();
+    const isRemoteJob = (jobRemote === "true" || jobRemote === "yes" || jobRemote === "remote");
+
+    const company = String(j.company || "");
+    const title = String(j.title || "");
+
+    const blockedCompany = blockedCompanies.includes(company.toLowerCase());
+    const blockedRole = blockedRoleKeywords.some(k => (title.toLowerCase().includes(k) || fullText.includes(k)));
+
+    // --- REQUIREMENT KEYWORDS (simple + explainable) ---
+    // We only use tokens we can justify: words in job requirements text.
+    const STOP = new Set([
+      "and","or","the","a","an","to","of","in","for","with","on","at","as","is","are",
+      "you","we","our","your","will","be","from","by","this","that","it","not","have",
+      "has","had","must","should","plus","etc","etc.","skills","experience","years"
+    ]);
+
+    const tokens = reqText
+      .replace(/[^a-z0-9+.#\s]/g, " ")
+      .split(/\s+/)
+      .map(x => x.trim())
+      .filter(x => x && x.length >= 2 && !STOP.has(x));
+
+    // keep unique tokens, limit to avoid noise
+    const uniqueReq = Array.from(new Set(tokens)).slice(0, 30);
+
+    // Coverage: requirement keyword is "covered" if it appears in:
+    // - student skills list, OR
+    // - any bullet evidence text, OR
+    // - the full job text also contains it (sanity) — already true because from reqText
+    const skillSet = new Set(skills.map(s => String(s).toLowerCase()));
+    const bulletTextJoined = bullets.join(" ");
+
+    let covered = 0;
+    for (const kw of uniqueReq) {
+      const inSkills = skillSet.has(kw);
+      const inBullets = bulletTextJoined.includes(kw);
+      if (inSkills || inBullets) covered++;
+    }
+
+    // Normalize by job requirements count (NOT by student skill count)
+    const reqCount = Math.max(1, uniqueReq.length);
+    let score = covered / reqCount;
+
+    // Small bonuses (bounded)
+    if (isRemoteJob && remoteOk) score += 0.10;
+    if (!isRemoteJob && location && String(j.location || "").toLowerCase().includes(location)) score += 0.05;
+
+    score = Math.max(0, Math.min(1, score));
+
+    const decision_reason = blockedCompany ? "blocked_company"
+      : blockedRole ? "blocked_role_keyword"
+      : (score >= minScore ? "selected" : "below_threshold");
+
+    return { job: j, score, decision_reason, covered, reqCount };
+  });
+
+
+  scored.sort((a, b) => b.score - a.score);
+
+  const now = new Date().toISOString();
+  const queueRows = scored.map(s => ({
+    student_id: studentId,
+    job_id: String(s.job.job_id || ""),
+    company: String(s.job.company || ""),
+    title: String(s.job.title || ""),
+    match_score: s.score,
+    decision: (s.decision_reason === "selected") ? "selected" : "skipped",
+    reason: s.decision_reason,
+    created_at: now,
+    requirements_map_json: ""
+  }));
+
+  handleReplaceRows_({
+    sheet: SHEETS.APPLY_QUEUE,
+    key_col: "student_id",
+    key_val: studentId,
+    rows: queueRows
+  });
+
+  const selected = scored.filter(s => s.decision_reason === "selected");
+  const toApply = selected.slice(0, maxApps);
+
+  const results = [];
+  for (let i = 0; i < toApply.length; i++) {
+    const s = toApply[i];
+    const job = s.job;
+
+    const appPayload = {
+      job_id: String(job.job_id || ""),
+      student_id: studentId,
+      company: String(job.company || ""),
+      title: String(job.title || ""),
+      submitted_at: new Date().toISOString(),
+      retry_count: 0,
+      package: {
+        student_id: studentId,
+        facts_profile: facts,
+        note: "Sandbox demo package. Facts-only; no invented claims.",
+        match_score: s.score
+      }
+    };
+
+    const resp = JSON.parse(doPostApply_(appPayload).getContent());
+
+    if (resp.ok) {
+      results.push({ ok: true, job_id: appPayload.job_id, score: s.score, receipt_id: resp.receipt.receipt_id });
+    } else {
+      handleLogApplicationAttempt_({
+        job_id: appPayload.job_id,
+        student_id: studentId,
+        company: appPayload.company,
+        title: appPayload.title,
+        status: "failed",
+        submitted_at: appPayload.submitted_at,
+        payload_hash: sha256_(JSON.stringify(appPayload)).slice(0, 16),
+        retry_count: 0,
+        failure_reason: resp.error,
+        package_json: JSON.stringify(appPayload.package)
+      });
+      results.push({ ok: false, job_id: appPayload.job_id, score: s.score, error: resp.error });
+    }
+  }
+
+  return {
+    ok: true,
+    student_id: studentId,
+    jobs_scored: jobs.length,
+    queue_written: queueRows.length,
+    selected_count: selected.length,
+    attempted: toApply.length,
+    results
+  };
+}
+
+/***********************
+ * Helpers
+ ***********************/
+function json_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+function ss_() { return SpreadsheetApp.getActiveSpreadsheet(); }
+function sheet_(name) {
+  const sh = ss_().getSheetByName(name);
+  if (!sh) throw new Error(`Missing sheet: ${name}`);
+  return sh;
+}
+function readTable_(sheetName) {
+  const sh = sheet_(sheetName);
+  const values = sh.getDataRange().getValues();
+  if (values.length < 2) return [];
+  const headers = values[0].map(h => String(h).trim());
+  const out = [];
+  for (let i = 1; i < values.length; i++) {
+    const row = values[i];
+    const obj = {};
+    let hasAny = false;
+    for (let c = 0; c < headers.length; c++) {
+      obj[headers[c]] = row[c];
+      if (String(row[c]).trim() !== "") hasAny = true;
+    }
+    if (hasAny) out.push(obj);
+  }
+  return out;
+}
+function appendRow_(sheetName, obj) {
+  const sh = sheet_(sheetName);
+  const data = sh.getDataRange().getValues();
+  if (data.length < 1) throw new Error(`Sheet ${sheetName} has no header row`);
+  const headers = data[0].map(h => String(h).trim());
+  const row = headers.map(h => (obj[h] !== undefined ? obj[h] : ""));
+  sh.appendRow(row);
+}
+function readPolicy_() {
+  const rows = readTable_(SHEETS.APPLY_POLICY);
+  const policy = {};
+  rows.forEach(r => {
+    const key = String(r.policy_key || "").trim();
+    if (!key) return;
+    policy[key] = r.policy_value;
+  });
+  return policy;
+}
+function sha256_(text) {
+  const raw = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    text,
+    Utilities.Charset.UTF_8
+  );
+  return raw.map(b => ('0' + (b & 0xFF).toString(16)).slice(-2)).join('');
+}
+function parseCsv_(x) {
+  return String(x || "")
+    .split(",")
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+
+function ui_getTopRanked(studentId, limit) {
+  const sid = String(studentId || "").trim();
+  const n = Math.max(1, Math.min(50, Number(limit || 10)));
+
+  const rows = readTable_(SHEETS.APPLY_QUEUE)
+    .filter(r => String(r.student_id) === sid)
+    .map(r => ({
+      job_id: r.job_id,
+      company: r.company,
+      title: r.title,
+      match_score: Number(r.match_score || 0),
+      decision: r.decision,
+      reason: r.reason
+    }))
+    .sort((a,b) => b.match_score - a.match_score)
+    .slice(0, n);
+
+  return { ok: true, student_id: sid, count: rows.length, ranked: rows };
+}
