@@ -1,0 +1,544 @@
+#index.html()
+/************************************
+ * MUST SET THIS
+ ************************************/
+const MASTER_SPREADSHEET_ID = "18voQWxcl-V5YWkH2ySWdtegDESGVDuq-JmBR_NtgUF0";
+
+/************************************
+ * SHEET NAMES (must match exactly)
+ ************************************/
+const SHEET_NAMES = {
+  STUDENT_PROFILE: "STUDENT_PROFILE",
+  BULLET_BANK: "BULLET_BANK",
+  ANSWER_LIBRARY: "ANSWER_LIBRARY",
+
+  JOBS: "JOBS",
+  APPLY_POLICY: "APPLY_POLICY",
+  APPLY_QUEUE: "APPLY_QUEUE",
+  APPLICATIONS: "APPLICATIONS",
+};
+
+/************************************
+ * WEB APP UI
+ ************************************/
+function doGet(e) {
+  const p = (e && e.parameter) ? e.parameter : {};
+  const path = String(p.path || "").trim();
+
+  // API routes
+  if (path === "api/ping") {
+    return ContentService.createTextOutput(JSON.stringify({
+      ok: true,
+      message: "pong",
+      ts: new Date().toISOString()
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // UI (default)
+  return HtmlService.createHtmlOutputFromFile("Index")
+    .setTitle("Student Intake UI");
+}
+
+
+/************************************
+ * CORE: Always open the correct spreadsheet
+ ************************************/
+function ss_() {
+  return SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+}
+
+function sh_(name) {
+  const sheet = ss_().getSheetByName(name);
+  if (!sheet) throw new Error("Missing sheet: " + name);
+  return sheet;
+}
+
+/************************************
+ * Header mapping (robust)
+ ************************************/
+function headerMap_(headerRow) {
+  const m = {};
+  headerRow.forEach((h, i) => {
+    if (h === null || h === undefined) return;
+    const key = String(h)
+      .trim()
+      .toLowerCase()
+      .replace(/\u00A0/g, " ")
+      .replace(/\s+/g, "_")
+      .replace(/[^\w_]/g, "");
+    if (key) m[key] = i + 1; // 1-based
+  });
+  return m;
+}
+
+function requireCols_(map, cols, sheetName) {
+  const missing = cols.filter(c => !map[c]);
+  if (missing.length) {
+    throw new Error(
+      sheetName + " header mismatch. Missing: " + missing.join(", ") +
+      "\nFix your header row to include these columns."
+    );
+  }
+}
+
+/************************************
+ * Utilities
+ ************************************/
+function sha256_(text) {
+  const raw = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    text,
+    Utilities.Charset.UTF_8
+  );
+  return raw.map(b => ('0' + (b & 0xFF).toString(16)).slice(-2)).join('');
+}
+
+function normalizeDate_(s) {
+  s = String(s || "").trim();
+  if (!s) return "";
+  // Accept YYYY-MM-DD only (safe + predictable)
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  // Accept MM/DD/YYYY and convert
+  const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) {
+    const mm = String(m[1]).padStart(2, "0");
+    const dd = String(m[2]).padStart(2, "0");
+    const yyyy = m[3];
+    return `${yyyy}-${mm}-${dd}`;
+  }
+  return "";
+}
+
+function csvToList_(s) {
+  return String(s || "")
+    .split(",")
+    .map(x => x.trim())
+    .filter(Boolean);
+}
+
+function tokenize_(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .map(t => t.trim())
+    .filter(t => t.length >= 2);
+}
+
+function readTable_(sheetName) {
+  const sh = sh_(sheetName);
+  const values = sh.getDataRange().getValues();
+  if (values.length < 2) return [];
+  const headers = values[0].map(h => String(h).trim());
+  const out = [];
+  for (let i = 1; i < values.length; i++) {
+    const row = values[i];
+    const obj = {};
+    let hasAny = false;
+    for (let c = 0; c < headers.length; c++) {
+      obj[headers[c]] = row[c];
+      if (String(row[c]).trim() !== "") hasAny = true;
+    }
+    if (hasAny) out.push(obj);
+  }
+  return out;
+}
+
+function appendRowObj_(sheetName, obj) {
+  const sh = sh_(sheetName);
+  const data = sh.getDataRange().getValues();
+  if (data.length < 1) throw new Error(`Sheet ${sheetName} has no header row`);
+  const headers = data[0].map(h => String(h).trim());
+
+  const row = headers.map(h => (obj[h] !== undefined ? obj[h] : ""));
+  sh.appendRow(row);
+}
+
+/************************************
+ * APPLY POLICY read
+ ************************************/
+function readApplyPolicy_() {
+  const rows = readTable_(SHEET_NAMES.APPLY_POLICY);
+  const policy = {
+    kill_switch: false,
+    max_applications_per_run: 10,
+    min_match_score: 0.55
+  };
+
+  rows.forEach(r => {
+    const k = String(r.policy_key || "").trim();
+    const v = r.policy_value;
+    if (!k) return;
+    if (k === "kill_switch") policy.kill_switch = String(v).toUpperCase() === "TRUE";
+    if (k === "max_applications_per_run") policy.max_applications_per_run = Number(v) || 10;
+    if (k === "min_match_score") policy.min_match_score = Number(v) || 0.55;
+  });
+
+  return policy;
+}
+
+/************************************
+ * 1) STUDENT PROFILE UPSERT  (UPDATED)
+ ************************************/
+function ui_saveStudentProfile(payload) {
+  if (!payload) throw new Error("No payload received.");
+  if (!payload.name || !payload.email) throw new Error("Name and email are required.");
+
+  const sheetName = SHEET_NAMES.STUDENT_PROFILE;
+  const sh = sh_(sheetName);
+
+  const header = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+  const col = headerMap_(header);
+
+  requireCols_(col, [
+    "student_id","name","email","phone","location","remote_ok","start_date","visa_status",
+    "links_json","facts_profile_json","last_updated_at"
+  ], sheetName);
+
+  const nowIso = new Date().toISOString();
+  const emailNorm = String(payload.email).trim().toLowerCase();
+
+  const remoteBool =
+    String(payload.remote_ok).toLowerCase() === "yes" ||
+    payload.remote_ok === true;
+
+  const startDate = normalizeDate_(payload.start_date);
+
+  const visaStatus = String(payload.visa_status || "unknown").trim() || "unknown";
+  const skills = csvToList_(payload.skills_csv).map(s => s.toLowerCase());
+
+  const links = csvToList_(payload.links_csv);
+  const linksJson = JSON.stringify(links);
+
+  const factsProfile = {
+    student_id: "", // filled after we know studentId
+    name: String(payload.name).trim(),
+    email: String(payload.email).trim(),
+    phone: payload.phone ? String(payload.phone).trim() : "",
+    location: payload.location ? String(payload.location).trim() : "",
+    remote_ok: remoteBool,
+    start_date: startDate || "",
+    visa_status: visaStatus,
+    skills: skills,
+    notes: String(payload.notes || "").trim() || "All skills explicitly provided by student. No inferred data."
+  };
+
+  // Find row by email
+  const lastRow = sh.getLastRow();
+  let row = lastRow + 1;
+
+  if (lastRow >= 2) {
+    const emails = sh.getRange(2, col.email, lastRow - 1, 1).getValues().flat();
+    for (let i = 0; i < emails.length; i++) {
+      if (String(emails[i] || "").trim().toLowerCase() === emailNorm) {
+        row = i + 2;
+        break;
+      }
+    }
+  }
+
+  // student_id: keep existing if updating, else create
+  let studentId = "";
+  if (row <= lastRow) studentId = String(sh.getRange(row, col.student_id).getValue() || "").trim();
+  if (!studentId) studentId = "student_" + Utilities.getUuid();
+
+  factsProfile.student_id = studentId;
+
+  // Write values
+  sh.getRange(row, col.student_id).setValue(studentId);
+  sh.getRange(row, col.name).setValue(String(payload.name).trim());
+  sh.getRange(row, col.email).setValue(String(payload.email).trim());
+  sh.getRange(row, col.phone).setValue(payload.phone ? String(payload.phone).trim() : "");
+  sh.getRange(row, col.location).setValue(payload.location ? String(payload.location).trim() : "");
+  sh.getRange(row, col.remote_ok).setValue(remoteBool);
+  sh.getRange(row, col.start_date).setValue(startDate || "");
+  sh.getRange(row, col.visa_status).setValue(visaStatus);
+  sh.getRange(row, col.links_json).setValue(linksJson);
+  sh.getRange(row, col.facts_profile_json).setValue(JSON.stringify(factsProfile));
+  sh.getRange(row, col.last_updated_at).setValue(nowIso);
+
+  return {
+    ok: true,
+    student_id: studentId,
+    row_written: row,
+    sheet: sheetName,
+    updated_at: nowIso
+  };
+}
+
+/************************************
+ * 2) BULLET BANK INSERT (many rows) (same)
+ ************************************/
+function ui_saveBullets(payload) {
+  if (!payload || !payload.student_id) throw new Error("Missing student_id.");
+  if (!Array.isArray(payload.bullets) || payload.bullets.length === 0) throw new Error("No bullets provided.");
+
+  const sheetName = SHEET_NAMES.BULLET_BANK;
+  const sh = sh_(sheetName);
+
+  const header = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+  const col = headerMap_(header);
+
+  requireCols_(col, ["bullet_id","student_id","source_type","source_name","bullet_text","skills_tags_json","evidence_links_json","created_at"], sheetName);
+
+  const nowIso = new Date().toISOString();
+  const rows = [];
+
+  payload.bullets.forEach(b => {
+    const text = String(b.bullet_text || "").trim();
+    if (!text) return;
+
+    const evidence = String(b.evidence_link || "").trim();
+    const evidenceJson = evidence ? JSON.stringify([evidence]) : "[]";
+
+    const row = new Array(header.length).fill("");
+    row[col.bullet_id - 1] = "bullet_" + Utilities.getUuid();
+    row[col.student_id - 1] = payload.student_id;
+    row[col.source_type - 1] = "user_provided";
+    row[col.source_name - 1] = "User provided";
+    row[col.bullet_text - 1] = text;
+    row[col.skills_tags_json - 1] = "[]";
+    row[col.evidence_links_json - 1] = evidenceJson;
+    row[col.created_at - 1] = nowIso;
+
+    rows.push(row);
+  });
+
+  if (rows.length === 0) throw new Error("All bullets were empty.");
+
+  sh.getRange(sh.getLastRow() + 1, 1, rows.length, header.length).setValues(rows);
+
+  return { ok: true, inserted: rows.length, sheet: sheetName, created_at: nowIso };
+}
+
+/************************************
+ * 3) ANSWER LIBRARY UPSERT (same)
+ ************************************/
+function ui_saveAnswers(payload) {
+  if (!payload || !payload.student_id) throw new Error("Missing student_id.");
+
+  const sheetName = SHEET_NAMES.ANSWER_LIBRARY;
+  const sh = sh_(sheetName);
+
+  const header = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+  const col = headerMap_(header);
+
+  requireCols_(col, ["student_id","question_key","question_text","answer_text","evidence_note","last_updated_at"], sheetName);
+
+  const nowIso = new Date().toISOString();
+  const evidenceNote = String(payload.evidence_note || "").trim() || "not provided by student";
+
+  const QUESTIONS = [
+    { key: "work_authorization", text: "Are you authorized to work?" },
+    { key: "availability", text: "When can you start?" },
+    { key: "relocation", text: "Are you open to relocation?" },
+    { key: "salary_expectations", text: "What are your salary expectations?" },
+  ];
+
+  const lastRow = sh.getLastRow();
+  const existing = {};
+  if (lastRow >= 2) {
+    const sids = sh.getRange(2, col.student_id, lastRow - 1, 1).getValues().flat();
+    const keys = sh.getRange(2, col.question_key, lastRow - 1, 1).getValues().flat();
+    for (let i = 0; i < sids.length; i++) {
+      if (String(sids[i] || "").trim() === payload.student_id) {
+        const k = String(keys[i] || "").trim();
+        if (k) existing[k] = i + 2;
+      }
+    }
+  }
+
+  QUESTIONS.forEach(q => {
+    const answer = payload.answers && payload.answers[q.key] != null
+      ? String(payload.answers[q.key]).trim()
+      : "";
+
+    const row = existing[q.key] || (sh.getLastRow() + 1);
+    if (!existing[q.key]) sh.appendRow(new Array(header.length).fill(""));
+
+    sh.getRange(row, col.student_id).setValue(payload.student_id);
+    sh.getRange(row, col.question_key).setValue(q.key);
+    sh.getRange(row, col.question_text).setValue(q.text);
+    sh.getRange(row, col.answer_text).setValue(answer || "unknown");
+    sh.getRange(row, col.evidence_note).setValue(evidenceNote);
+    sh.getRange(row, col.last_updated_at).setValue(nowIso);
+  });
+
+  return { ok: true, sheet: sheetName, updated_at: nowIso };
+}
+
+/************************************
+ * 4) AUTO SEARCH + AUTO APPLY (NEW)
+ * Called from UI using google.script.run
+ ************************************/
+function ui_runAutoSearchApply(student_id) {
+  const sid = String(student_id || "").trim();
+  if (!sid) throw new Error("Missing student_id. Save profile first.");
+
+  const policy = readApplyPolicy_();
+  if (policy.kill_switch) {
+    return { ok: false, error: "KILL_SWITCH_ON", selected_count: 0, attempted: 0, results: [] };
+  }
+
+  // Load student facts
+  const profiles = readTable_(SHEET_NAMES.STUDENT_PROFILE);
+  const pr = profiles.find(r => String(r.student_id) === sid);
+  if (!pr) throw new Error("Student not found in STUDENT_PROFILE: " + sid);
+
+  let facts = {};
+  try { facts = JSON.parse(String(pr.facts_profile_json || "{}")); } catch(e) { facts = {}; }
+
+  const skills = Array.isArray(facts.skills) ? facts.skills.map(s => String(s).toLowerCase()) : [];
+  const remoteOk = !!facts.remote_ok;
+  const startDate = String(facts.start_date || "").trim();
+
+  // Bullets (evidence)
+  const bullets = readTable_(SHEET_NAMES.BULLET_BANK).filter(b => String(b.student_id) === sid);
+  const bulletTextAll = bullets.map(b => String(b.bullet_text || "")).join(" ").toLowerCase();
+
+  // Jobs
+  const jobs = readTable_(SHEET_NAMES.JOBS);
+
+  // Score jobs
+  const scored = jobs.map(j => {
+    const reqText = String(j.requirements_text || "");
+    const reqTokens = tokenize_(reqText);
+
+    // Skill overlap score
+    const matches = reqTokens.filter(t => skills.includes(t));
+    const skillScore = reqTokens.length ? (matches.length / reqTokens.length) : 0;
+
+    // Evidence bonus (if requirements words appear in bullet text)
+    const evHits = reqTokens.filter(t => bulletTextAll.includes(t));
+    const evidenceScore = reqTokens.length ? (evHits.length / reqTokens.length) : 0;
+
+    // Constraints
+    let constraintOk = true;
+    // Remote constraint: if job says FALSE and student remote only, still ok because remote_ok means allowed, not required.
+    // But if student remote_ok=false and job is remote=true, still ok. So remote never blocks in this simplified demo.
+    // Start date constraint: if job has start_date and student start_date, ensure student can start on/before job start
+    const jobStart = String(j.start_date || "").trim();
+    if (jobStart && startDate) {
+      // compare as YYYY-MM-DD strings
+      if (startDate > jobStart) constraintOk = false;
+    }
+
+    const raw = 0.75 * skillScore + 0.25 * evidenceScore;
+
+    return {
+      job_id: String(j.job_id),
+      company: String(j.company || ""),
+      title: String(j.title || ""),
+      match_score: Number(raw.toFixed(3)),
+      constraint_ok: constraintOk,
+      requirements_sample: reqTokens.slice(0, 8).join(", ")
+    };
+  });
+
+  // Select candidates
+  const eligible = scored
+    .filter(x => x.constraint_ok)
+    .sort((a,b) => b.match_score - a.match_score);
+
+  const selected = eligible.filter(x => x.match_score >= policy.min_match_score);
+  const selectedLimited = selected.slice(0, policy.max_applications_per_run);
+
+  // Write APPLY_QUEUE (optional, but helpful)
+  writeApplyQueue_(sid, eligible, selectedLimited);
+
+  // Apply
+  const results = [];
+  selectedLimited.forEach(item => {
+    const outcome = submitApplication_(sid, item);
+    results.push(outcome);
+  });
+
+  return {
+    ok: true,
+    selected_count: selectedLimited.length,
+    attempted: selectedLimited.length,
+    results: results
+  };
+}
+
+function writeApplyQueue_(studentId, eligibleSorted, selectedLimited) {
+  const sh = sh_(SHEET_NAMES.APPLY_QUEUE);
+  const header = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+  const col = headerMap_(header);
+
+  // We won't hard-fail if columns differ; we write only what exists.
+  const nowIso = new Date().toISOString();
+
+  // Delete prior rows for this student_id (best effort)
+  const data = sh.getDataRange().getValues();
+  if (data.length >= 2 && col.student_id) {
+    for (let r = data.length - 1; r >= 1; r--) {
+      if (String(data[r][col.student_id - 1]).trim() === String(studentId)) {
+        sh.deleteRow(r + 1);
+      }
+    }
+  }
+
+  const selectedSet = new Set(selectedLimited.map(x => x.job_id));
+
+  eligibleSorted.forEach(item => {
+    const row = new Array(header.length).fill("");
+    if (col.student_id) row[col.student_id - 1] = studentId;
+    if (col.job_id) row[col.job_id - 1] = item.job_id;
+    if (col.match_score) row[col.match_score - 1] = item.match_score;
+    if (col.decision) row[col.decision - 1] = selectedSet.has(item.job_id) ? "selected" : "skipped";
+    if (col.reason) row[col.reason - 1] = selectedSet.has(item.job_id) ? "score>=threshold" : "below_threshold_or_limit";
+    if (col.created_at) row[col.created_at - 1] = nowIso;
+    sh.appendRow(row);
+  });
+}
+
+function submitApplication_(studentId, jobItem) {
+  // Simulate rare failures like your earlier API did
+  const r = Math.random();
+  let status = "submitted";
+  let failure_reason = "";
+  let receipt_id = "";
+
+  if (r < 1/12) { status = "failed"; failure_reason = "RATE_LIMIT_SIMULATED"; }
+  else if (r < 1/10) { status = "failed"; failure_reason = "TEMP_FAILURE_SIMULATED"; }
+
+  const nowIso = new Date().toISOString();
+  const payload = {
+    job_id: jobItem.job_id,
+    student_id: studentId,
+    match_score: jobItem.match_score,
+    company: jobItem.company,
+    title: jobItem.title,
+    submitted_at: nowIso
+  };
+
+  const payload_hash = sha256_(JSON.stringify(payload)).slice(0,16);
+  if (status === "submitted") receipt_id = Utilities.getUuid();
+
+  appendRowObj_(SHEET_NAMES.APPLICATIONS, {
+    application_id: Utilities.getUuid(),
+    receipt_id: receipt_id,
+    job_id: jobItem.job_id,
+    company: jobItem.company,
+    title: jobItem.title,
+    student_id: studentId,
+    status: status,
+    submitted_at: nowIso,
+    received_at: nowIso,
+    payload_hash: payload_hash,
+    retry_count: 0,
+    failure_reason: failure_reason,
+    package_json: JSON.stringify(payload)
+  });
+
+  return {
+    job_id: jobItem.job_id,
+    company: jobItem.company,
+    title: jobItem.title,
+    match_score: jobItem.match_score,
+    status: status,
+    receipt_id: receipt_id,
+    failure_reason: failure_reason
+  };
+}
